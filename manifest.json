@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "manifest_version": 1,
   "author": "Maksym",
-  "description": "Dice roller and progress clocks for Blades in the Dark and other Forged in the Dark games. Action / Resistance / Fortune rolls with position and effect; shared clocks synced via room metadata.",
+  "description": "Dice roller and progress clocks for Blades in the Dark.",
   "license": "MIT",
   "action": {
     "title": "Blades in the Dark",
