@@ -4,8 +4,8 @@
   "manifest_version": 1,
   "action": {
     "title": "Blades in the Dark",
-    "icon": "/icon.svg",
-    "popover": "/index.html",
+    "icon": "https://purplesingularity.github.io/blades_or/icon.svg",
+    "popover": "https://purplesingularity.github.io/blades_or/index.html",
     "height": 720,
     "width": 380
   }
