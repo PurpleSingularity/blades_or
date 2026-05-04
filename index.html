@@ -394,6 +394,7 @@
     }
     .clock-btn:hover { background: var(--bg-3); color: var(--brass); border-color: var(--brass-dim); }
     .clock-btn.danger:hover { color: var(--crimson); border-color: var(--crimson-dim); }
+    .clock-btn.on { color: var(--brass); border-color: var(--brass-dim); background: var(--bg-3); box-shadow: 0 0 6px rgba(212,161,74,.25) inset; }
 
     .new-clock-btn {
       width: 100%;
@@ -587,10 +588,12 @@
        Single-file popover. ES module so we can `import` the SDK.
        ──────────────────────────────────────────────────────── */
     let OBR = null;
+    let buildImage = null;
     let isInOR = false;
     try {
       const mod = await import("https://esm.sh/@owlbear-rodeo/sdk@3.1.0");
       OBR = mod.default;
+      buildImage = mod.buildImage;
       isInOR = !!(OBR && OBR.isAvailable);
     } catch (e) {
       console.warn("OBR SDK load failed; running standalone.", e);
@@ -600,6 +603,8 @@
     const NS              = "com.maksym.blades-or";
     const CLOCKS_KEY      = `${NS}/clocks`;
     const DICE_CHANNEL    = `${NS}/dice-roll`;
+    // Scene items we own carry this metadata key pointing back to the clock id.
+    const ITEM_CLOCK_KEY  = `${NS}/clockId`;
 
     // ─── state ──────────────────────────────────────────────
     const state = {
@@ -608,9 +613,13 @@
       position: "risky",
       effect: "standard",
       newClockSize: 6,
-      clocks: [],              // [{id, name, size, filled}]
+      clocks: [],              // [{id, name, size, filled, onTable, sceneItemId}]
       feed: [],                // ephemeral; capped
-      me: { name: "You", color: "#d4a14a", role: "PLAYER" }
+      me: { name: "You", color: "#d4a14a", role: "PLAYER" },
+      sceneReady: false,       // true while a scene is loaded — needed for scene items
+      // Suppress reconciliation while we're applying our own scene-item changes,
+      // otherwise the items.onChange listener would chase its own tail.
+      ignoreItemChange: false
     };
     const FEED_CAP = 14;
 
@@ -781,6 +790,8 @@
     }
 
     // ─── clocks ─────────────────────────────────────────────
+    // Two SVG generators: one for the popover (uses CSS vars),
+    // one for the scene image (uses literal hex — data URLs have no CSS context).
     function clockSVG(filled, size, dim = 56) {
       const r  = dim / 2 - 3;
       const cx = dim / 2, cy = dim / 2;
@@ -796,9 +807,138 @@
         const stroke = "var(--line-strong)";
         paths += `<path d="M ${cx} ${cy} L ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${largeArc} 1 ${x1.toFixed(2)} ${y1.toFixed(2)} Z" fill="${fill}" stroke="${stroke}" stroke-width="1.2"/>`;
       }
-      // outer ring
       paths += `<circle cx="${cx}" cy="${cy}" r="${r + 1}" fill="none" stroke="var(--brass-dim)" stroke-width="1"/>`;
       return `<svg class="clock-svg" viewBox="0 0 ${dim} ${dim}" width="${dim}" height="${dim}">${paths}</svg>`;
+    }
+
+    // Scene-canvas version — bigger, with a parchment backplate and brass ring,
+    // so it stays legible on any map. Returns a full <svg> string.
+    function clockSceneSVG(filled, size) {
+      const dim = 256, cx = dim / 2, cy = dim / 2;
+      const ringR = 116;        // outer brass ring radius
+      const segR  = 100;        // pie radius
+      // hex literals — must resolve without CSS context
+      const C = {
+        plate:  "#1a1208",
+        ringIn: "#3a2d23",
+        ringOut:"#5a4632",
+        fill:   "#d4a14a",
+        empty:  "#241a12",
+        line:   "#5a4632",
+        glow:   "#f3c878"
+      };
+      let paths = "";
+      for (let i = 0; i < size; i++) {
+        const a0 = (i / size) * Math.PI * 2 - Math.PI / 2;
+        const a1 = ((i + 1) / size) * Math.PI * 2 - Math.PI / 2;
+        const x0 = cx + segR * Math.cos(a0), y0 = cy + segR * Math.sin(a0);
+        const x1 = cx + segR * Math.cos(a1), y1 = cy + segR * Math.sin(a1);
+        const largeArc = (a1 - a0) > Math.PI ? 1 : 0;
+        const fc = i < filled ? C.fill : C.empty;
+        paths += `<path d="M ${cx} ${cy} L ${x0.toFixed(2)} ${y0.toFixed(2)} A ${segR} ${segR} 0 ${largeArc} 1 ${x1.toFixed(2)} ${y1.toFixed(2)} Z" fill="${fc}" stroke="${C.line}" stroke-width="2"/>`;
+      }
+      const complete = filled >= size;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${dim} ${dim}" width="${dim}" height="${dim}">
+        <circle cx="${cx}" cy="${cy}" r="${ringR + 4}" fill="${C.ringOut}"/>
+        <circle cx="${cx}" cy="${cy}" r="${ringR}"      fill="${C.plate}" stroke="${C.ringIn}" stroke-width="2"/>
+        ${paths}
+        <circle cx="${cx}" cy="${cy}" r="${segR + 2}" fill="none" stroke="${complete ? C.glow : C.fill}" stroke-width="${complete ? 3 : 1.5}" opacity="${complete ? 0.9 : 0.55}"/>
+        <circle cx="${cx}" cy="${cy}" r="6" fill="${C.fill}"/>
+      </svg>`;
+    }
+
+    // Unicode-safe base64 wrapper (handles non-ASCII names if user adds emoji etc.).
+    function b64Utf8(str) {
+      return btoa(unescape(encodeURIComponent(str)));
+    }
+    function clockSceneDataURL(filled, size) {
+      return "data:image/svg+xml;base64," + b64Utf8(clockSceneSVG(filled, size));
+    }
+
+    // ─── scene-item lifecycle for clocks ────────────────────
+    async function createSceneClock(clock) {
+      if (!isInOR || !state.sceneReady || !buildImage) return null;
+
+      // Stagger initial positions a bit so multiple clocks don't perfectly stack.
+      const offset = 60 * state.clocks.filter(c => c.onTable).length;
+      const url = clockSceneDataURL(clock.filled, clock.size);
+
+      const item = buildImage(
+        { width: 256, height: 256, url, mime: "image/svg+xml" },
+        { dpi: 128, offset: { x: 128, y: 128 } }   // 128 dpi = clock spans 2 grid cells
+      )
+        .position({ x: offset, y: offset })
+        .plainText(`${clock.name}  ${clock.filled}/${clock.size}`)
+        .name(clock.name)
+        .metadata({ [ITEM_CLOCK_KEY]: clock.id })
+        .build();
+
+      try {
+        state.ignoreItemChange = true;
+        await OBR.scene.items.addItems([item]);
+        return item.id;
+      } catch (e) {
+        console.warn("addItems failed", e);
+        return null;
+      } finally {
+        // release on next tick after onChange has fired
+        setTimeout(() => { state.ignoreItemChange = false; }, 50);
+      }
+    }
+
+    async function updateSceneClock(clock) {
+      if (!isInOR || !state.sceneReady || !clock.sceneItemId) return;
+      const url = clockSceneDataURL(clock.filled, clock.size);
+      try {
+        state.ignoreItemChange = true;
+        await OBR.scene.items.updateItems([clock.sceneItemId], (items) => {
+          for (const it of items) {
+            if (it.image) it.image.url = url;
+            it.text = it.text || {};
+            it.text.plainText = `${clock.name}  ${clock.filled}/${clock.size}`;
+            it.name = clock.name;
+          }
+        });
+      } catch (e) {
+        console.warn("updateItems failed", e);
+      } finally {
+        setTimeout(() => { state.ignoreItemChange = false; }, 50);
+      }
+    }
+
+    async function deleteSceneClock(clock) {
+      if (!isInOR || !clock.sceneItemId) return;
+      try {
+        state.ignoreItemChange = true;
+        await OBR.scene.items.deleteItems([clock.sceneItemId]);
+      } catch (e) {
+        console.warn("deleteItems failed", e);
+      } finally {
+        setTimeout(() => { state.ignoreItemChange = false; }, 50);
+      }
+    }
+
+    // Toggle whether a clock has a scene-item representation.
+    async function toggleClockOnTable(id) {
+      const c = state.clocks.find(x => x.id === id);
+      if (!c) return;
+      if (!state.sceneReady) {
+        alert("Open a scene first to put clocks on the table.");
+        return;
+      }
+      if (c.onTable && c.sceneItemId) {
+        await deleteSceneClock(c);
+        c.onTable = false;
+        c.sceneItemId = null;
+      } else {
+        const newId = await createSceneClock(c);
+        if (newId) {
+          c.onTable = true;
+          c.sceneItemId = newId;
+        }
+      }
+      renderClocks();
+      persistClocks();
     }
 
     function renderClocks() {
@@ -812,9 +952,10 @@
           ${clockSVG(c.filled, c.size)}
           <div>
             <div class="clock-name" contenteditable="true" spellcheck="false" data-act="rename">${escapeHtml(c.name)}</div>
-            <div class="clock-progress">${c.filled} / ${c.size}</div>
+            <div class="clock-progress">${c.filled} / ${c.size}${c.onTable ? ' · on table' : ''}</div>
           </div>
           <div class="clock-controls">
+            <button class="clock-btn ${c.onTable ? 'on' : ''}" data-act="table" title="${c.onTable ? 'Remove from table' : 'Place on table'}">⌖</button>
             <button class="clock-btn" data-act="dec" title="Tick down">−</button>
             <button class="clock-btn" data-act="inc" title="Tick up">+</button>
             <button class="clock-btn danger" data-act="del" title="Delete">×</button>
@@ -830,24 +971,29 @@
       } catch (e) { console.warn("metadata save failed", e); }
     }
 
-    function tickClock(id, delta) {
+    async function tickClock(id, delta) {
       const c = state.clocks.find(x => x.id === id);
       if (!c) return;
       c.filled = Math.max(0, Math.min(c.size, c.filled + delta));
       renderClocks();
+      if (c.onTable) await updateSceneClock(c);
       persistClocks();
     }
-    function deleteClock(id) {
+    async function deleteClock(id) {
+      const c = state.clocks.find(x => x.id === id);
+      if (!c) return;
+      if (c.onTable) await deleteSceneClock(c);
       state.clocks = state.clocks.filter(x => x.id !== id);
       renderClocks();
       persistClocks();
     }
-    function renameClock(id, newName) {
+    async function renameClock(id, newName) {
       const c = state.clocks.find(x => x.id === id);
       if (!c) return;
       const trimmed = newName.trim().slice(0, 60) || "Untitled clock";
       if (c.name === trimmed) return;
       c.name = trimmed;
+      if (c.onTable) await updateSceneClock(c);
       persistClocks();
     }
     function createClock(name, size) {
@@ -855,7 +1001,9 @@
         id: uid(),
         name: (name || "Untitled clock").trim().slice(0, 60),
         size,
-        filled: 0
+        filled: 0,
+        onTable: false,
+        sceneItemId: null
       };
       state.clocks.push(c);
       renderClocks();
@@ -913,6 +1061,7 @@
       const act = e.target.dataset.act;
       if (act === "inc") tickClock(id, +1);
       else if (act === "dec") tickClock(id, -1);
+      else if (act === "table") toggleClockOnTable(id);
       else if (act === "del") {
         if (confirm("Delete this clock?")) deleteClock(id);
       }
@@ -963,7 +1112,9 @@
           id: c.id || uid(),
           name: String(c.name || "Untitled").slice(0, 60),
           size: [4, 6, 8, 12].includes(c.size) ? c.size : 6,
-          filled: Math.max(0, Math.min(c.size || 6, c.filled || 0))
+          filled: Math.max(0, Math.min(c.size || 6, c.filled || 0)),
+          onTable: !!c.onTable,
+          sceneItemId: c.sceneItemId || null
         }));
       } else {
         state.clocks = [];
@@ -979,6 +1130,49 @@
       } catch (e) {}
     }
 
+    // When a scene becomes ready, ensure on-table clocks actually have
+    // matching scene items. When a scene closes, clear our scene-item ids.
+    async function reconcileSceneItems() {
+      if (!isInOR || !state.sceneReady) return;
+      let dirty = false;
+      // Collect existing items tagged with our key
+      let existing = [];
+      try {
+        existing = await OBR.scene.items.getItems(
+          (it) => it && it.metadata && it.metadata[ITEM_CLOCK_KEY]
+        );
+      } catch (e) { console.warn("getItems failed", e); }
+
+      const byClockId = new Map();
+      for (const it of existing) byClockId.set(it.metadata[ITEM_CLOCK_KEY], it);
+
+      // For each clock that wants to be on table, make sure its item exists.
+      for (const c of state.clocks) {
+        if (!c.onTable) continue;
+        const found = byClockId.get(c.id);
+        if (found) {
+          if (c.sceneItemId !== found.id) { c.sceneItemId = found.id; dirty = true; }
+          // Also push current visual in case clock state moved while scene was closed
+          await updateSceneClock(c);
+          byClockId.delete(c.id);
+        } else {
+          const newId = await createSceneClock(c);
+          if (newId) { c.sceneItemId = newId; dirty = true; }
+          else       { c.onTable = false; c.sceneItemId = null; dirty = true; }
+        }
+      }
+      // Any remaining items with our tag but no matching clock are orphans
+      const orphanIds = [...byClockId.values()].map(it => it.id);
+      if (orphanIds.length) {
+        try {
+          state.ignoreItemChange = true;
+          await OBR.scene.items.deleteItems(orphanIds);
+        } catch (e) { console.warn(e); }
+        finally { setTimeout(() => state.ignoreItemChange = false, 50); }
+      }
+      if (dirty) { renderClocks(); persistClocks(); }
+    }
+
     if (isInOR) {
       OBR.onReady(async () => {
         await refreshIdentity();
@@ -989,15 +1183,53 @@
           applyRoomMetadata(meta || {});
         } catch (e) { console.warn(e); }
 
-        // sync clocks
+        // sync clocks (popover state + room-wide)
         OBR.room.onMetadataChange(applyRoomMetadata);
 
         // remote rolls
         OBR.broadcast.onMessage(DICE_CHANNEL, ev => {
           const p = ev.data;
           if (!p || !p.result) return;
-          renderLastRoll(p);   // show their roll in the spotlight too
+          renderLastRoll(p);
           pushFeed(p);
+        });
+
+        // scene readiness — needed before we touch scene.items
+        try {
+          state.sceneReady = await OBR.scene.isReady();
+        } catch (e) { state.sceneReady = false; }
+
+        OBR.scene.onReadyChange(async (ready) => {
+          state.sceneReady = ready;
+          if (ready) {
+            await reconcileSceneItems();
+          } else {
+            // Scene closed: forget item ids; they'll be reattached on next open.
+            for (const c of state.clocks) c.sceneItemId = null;
+            renderClocks();
+          }
+        });
+
+        if (state.sceneReady) await reconcileSceneItems();
+
+        // If a player deletes a clock token directly from the canvas, sync that
+        // back into our metadata so the popover reflects reality.
+        OBR.scene.items.onChange(async (items) => {
+          if (state.ignoreItemChange) return;
+          const liveIds = new Set(
+            items
+              .filter(it => it.metadata && it.metadata[ITEM_CLOCK_KEY])
+              .map(it => it.id)
+          );
+          let dirty = false;
+          for (const c of state.clocks) {
+            if (c.onTable && c.sceneItemId && !liveIds.has(c.sceneItemId)) {
+              c.onTable = false;
+              c.sceneItemId = null;
+              dirty = true;
+            }
+          }
+          if (dirty) { renderClocks(); persistClocks(); }
         });
       });
     } else {
