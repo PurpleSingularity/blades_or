@@ -2,9 +2,6 @@
   "name": "Blades in the Dark",
   "version": "1.0.0",
   "manifest_version": 1,
-  "author": "Maksym",
-  "description": "Dice roller and progress clocks for Blades in the Dark.",
-  "license": "MIT",
   "action": {
     "title": "Blades in the Dark",
     "icon": "/icon.svg",
